@@ -4,10 +4,11 @@ labrador
 1) gem install fog; gem install trollop
 
 2) Configure a fog_rc file
-
+```
 :sysops_account:
   :aws_access_key_id: some_key
   :aws_secret_access_key: some_secret
+```
 
 3) put your ssh keys in keys/ dir
 4) run makeVPC.rb -h
