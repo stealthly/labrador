@@ -2,19 +2,25 @@ labrador
 ========
 
 1) gem install fog; gem install trollop
-2) Configure a fog_rc file
 
+2) Configure a fog_rc file
+```
 :sysops_account:
   :aws_access_key_id: some_key
   :aws_secret_access_key: some_secret
+```
 
 3) put your ssh keys in keys/ dir
 4) run makeVPC.rb -h
 
 This makes a VPC called test VPC with a 10.200/16 network, one external to internet 10.200.1 and one internal only 10.200.200
+
 This also make two security groups with port 22 and 33333 open to 10.200.1 hosts.
+
 This also searches for the Amazon NAT ami images, boots it, tags it and logs in.
+
 ./makeVPC.rb -f ./fog_rc --fog-credential sysops_account -b 10.200.0.0/16 -d 10.200.1.0/24 -i 10.200.200.0/24 --name testVPC -r eu-west-1
+
 
 ```
 └─> ./makeVPC.rb -f ./fog_rc --fog-credential sysops_account -b 10.200.0.0/16 -d 10.200.1.0/24 -i 10.200.200.0/24 --name testVPC -r eu-west-1 --vpcID vpc-a3c72cc6
