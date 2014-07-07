@@ -27,7 +27,7 @@ opts = Trollop::options do
     opt :name, "VPC Name", :type => :string, :required  => true
     opt :region, "Region", :type => :string, :default => 'us-east-1', :required  => true
     opt :vpcID, "vpcID", :type => :string
-    opt :node_name, "The chef node name", :type => :string 
+    opt :node_name, "The chef node name", :type => :string, :required => true
     opt :key_name, "The ssh keypair name in AWS to use", :type => :string , :required  => true
     opt :key_file_pub, "The ssh public key file to use", :type => :string, :required  => true
     opt :key_file_private, "The ssh private keyfile to use", :type => :string, :required  => true
@@ -42,6 +42,8 @@ ENV['DEBUG'] ='true'
 ENV['FOG_CREDENTIAL']= opts[:fog_credential]
 
 compute=Fog::Compute.new(:provider => 'AWS', :region => opts[:region])
+dns=Fog::DNS.new(:provider => 'AWS')
+
 ########################################################################################
 # MAIN
 #
@@ -49,7 +51,14 @@ puts "Checking on and Making....\n"
 puts "VPC....\n"
 if opts[:vpcID] 
     vpcID=opts[:vpcID]
-    puts "\tVPC exists #{vpcID}"
+    filters={:'tag-value' => opts[:name] }
+    vpcs=compute.describe_vpcs(filters)
+    a=vpcs.body['vpcSet'].select { |vpc| vpc['vpcId'] == vpcID }
+    if a.count > 0
+        puts "\tVPC exists..."
+    else
+        abort("Vpc does exist")
+    end
 else
     # if not vpcID was specified check if one with provided name exists
     filters={:'tag-value' => opts[:name] }
@@ -57,7 +66,7 @@ else
     vpcs.body['vpcSet'].each do |vpc|
         puts "\nAdd --vpcID to continue."
         puts "VPC with the name of "  +vpc['tagSet']['Name']+ " exists:"
-        abort(vpc.to_s)
+        abort("VPC ID: #{vpc['vpcId']}")
     end
     # else create it and return vpcID
     vpc=compute.vpcs.create({"cidr_block" => opts[:block] })
@@ -67,8 +76,16 @@ else
 end
 
 gwayID=make_or_get_igw(compute, vpcID, opts)
-route_table_id=make_or_get_routes(compute, vpcID, gwayID, opts)
-make_or_get_subnets(compute, vpcID, route_table_id, 0, opts)
+# Make a route and give route table id to subnet
+dmz_route_table_id=make_or_get_routes(compute, vpcID, gwayID, "DMZ_2_INET::#{opts[:name]}", opts)
+# Make a subnet and associate a route
+make_or_get_subnets(compute, vpcID, dmz_route_table_id, "DMZ_Subnet::#{opts[:name]}", 0, opts)
+# Make Security groups
 make_or_get_security_grps(compute, vpcID, 0, opts)
-make_or_get_nat_node(compute,vpcID, opts)
+# Make Nat box
+server=make_or_get_nat_node(compute,vpcID, opts)
+pp server
+inet_route_table_id=make_or_get_routes(compute, vpcID, server.id, "INTRA_2_NAT::#{opts[:name]}", opts)
+make_or_get_subnets(compute, vpcID, inet_route_table_id, "INTRANET_Subnet::#{opts[:name]}", 0, opts)
+create_dns_record(dns, server.public_ip_address, opts[:node_name], 1800)
 #make_or_get_eip(compute,vpcID)

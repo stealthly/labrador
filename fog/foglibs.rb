@@ -1,6 +1,19 @@
 #!/usr/bin/ruby
 require 'fog'
 require 'pp'
+
+# VPC
+def get_vpc(compute, vpcName, opts)
+    # returns vpcID or nil
+    filters={:'tag-value' => opts[:name] }
+    vpcs=compute.describe_vpcs(filters)
+    ts=vpcs.body['vpcSet'].select {|ig| ig['tagSet']['Name'] == opts[:name] }
+    if ts.count > 0 and ts.count < 2
+        return ts.first['vpcId']
+    else
+        return nil
+    end
+end
 # INTERNET GATEWAY
 def make_or_get_igw(compute, vpcID, opts)
     puts "Internet gway... #{vpcID}\n"
@@ -14,7 +27,7 @@ def make_or_get_igw(compute, vpcID, opts)
         if vpcID == gway.attachment_set['vpcId']
             gatewayID=gway.id
             created=1
-            puts "\tInternet gway id " +gatewayID+ " for vpc exists " +vpcID
+            puts "\tInternet gway id " +gatewayID+ " for vpc exists and is attached " +vpcID
         end
     end
     #
@@ -38,14 +51,14 @@ def make_or_get_igw(compute, vpcID, opts)
 end
 
 #  ROUTES
-def make_or_get_routes(compute, vpcID, gwayID, opts)
+def make_or_get_routes(compute, vpcID, target, name, opts)
     puts "Routes....\n"
     created=0
     routes=compute.describe_route_tables()
     rti=nil
     routes.body['routeTableSet'].each do |route|
         #each one of these is a route
-        if route['tagSet']['Name']== opts[:name]
+        if route['tagSet']['Name']== name
             created=1
             rti=route['routeTableId']
             puts "\tFound route #{rti} for: #{opts[:name]}"
@@ -61,46 +74,57 @@ def make_or_get_routes(compute, vpcID, gwayID, opts)
             sleep 5
             break if routes.body['routeTableSet'].select {|associationSet|  associationSet['routeTableId'] == rti }
         end
-        tag=compute.create_tags(new_route.body['routeTable'][0]['routeTableId'], {"Name" => opts[:name]})
+        tag=compute.create_tags(new_route.body['routeTable'][0]['routeTableId'], {"Name" => name})
         rti=new_route.body['routeTable'][0]['routeTableId']
-        compute.create_route(rti, '0.0.0.0/0', internet_gateway_id = gwayID, instance_id = nil, network_interface_id = nil)
+        if target =~ /igw/
+            compute.create_route(rti, '0.0.0.0/0', internet_gateway_id = target, instance_id = nil, network_interface_id = nil)
+        end
+        if target =~ /i-/
+            compute.create_route(rti, '0.0.0.0/0', internet_gateway_id = nil, instance_id = target, network_interface_id = nil)
+        end
         puts "\tRoutes created #{rti}"
     end
     return rti
 end
-def make_or_get_subnets(compute, vpcID, route_table_id, get, opts)
+def make_or_get_subnets(compute, vpcID, route_table_id, subnetName, get, opts)
     puts "Subnets...\n"
     created=0
-    check_for=['INTRANET', 'DMZ']
     subnets=compute.describe_subnets()
     return subnets if get == 1
     subnets.body['subnetSet'].each do |subnet|
-        if check_for.include?(subnet['tagSet']['Name'].to_s)
-            check_for.delete(subnet['tagSet']['Name'].to_s)
+        puts "\t checking for #{subnetName} against #{subnet['tagSet']['Name']}"
+        if subnetName == subnet['tagSet']['Name'].to_s
             created=created+1
+            #check associations!
+            pp subnet
+            puts "\tSubnet #{subnet['tagSet']['Name']} exist for VPC #{vpcID}"
         end
     end
-    if created < 2
-        si=compute.create_subnet(vpcID, opts[:i_subnet])
-        loop do
-            subnets=compute.describe_subnets()
-            sleep 5
-            break if subnets.body['subnetSet'].select {|subnetSet| subnetSet['subnetId'] == si.body['subnet']['subnetId']}
+    if created < 1
+        if subnetName == "INTRANET_Subnet::#{opts[:name]}"
+            puts "\t creating INTRANET_Subnet::#{opts[:name]}"
+            si=compute.create_subnet(vpcID, opts[:i_subnet])
+            loop do
+                subnets=compute.describe_subnets()
+                sleep 5
+                break if subnets.body['subnetSet'].select {|subnetSet| subnetSet['subnetId'] == si.body['subnet']['subnetId']}
+            end
+            compute.create_tags(si.body['subnet']['subnetId'], {"Name" => "INTRANET_Subnet::#{opts[:name]}"})
+            compute.associate_route_table(route_table_id, si.body['subnet']['subnetId'])
+            puts "\tSubnet #{si.body['subnet']['subnetId']} created for VPC #{vpcID}"
         end
-        compute.create_tags(si.body['subnet']['subnetId'], {"Name" => "INTRANET"})
-        compute.associate_route_table(route_table_id, si.body['subnet']['subnetId'])
-        #
-        sd=compute.create_subnet( vpcID, opts[:d_subnet])
-        loop do
-            subnets=compute.describe_subnets()
-            sleep 5
-            break if subnets.body['subnetSet'].select {|subnetSet| subnetSet['subnetId'] == sd.body['subnet']['subnetId']}
+        if subnetName == "DMZ_Subnet::#{opts[:name]}"
+            puts "\t creating DMZ_Subnet::#{opts[:name]}"
+            sd=compute.create_subnet( vpcID, opts[:d_subnet])
+            loop do
+                subnets=compute.describe_subnets()
+                sleep 5
+                break if subnets.body['subnetSet'].select {|subnetSet| subnetSet['subnetId'] == sd.body['subnet']['subnetId']}
+            end
+            compute.create_tags(sd.body['subnet']['subnetId'], {"Name" => "DMZ_Subnet::#{opts[:name]}"})
+            compute.associate_route_table(route_table_id, sd.body['subnet']['subnetId'])
+            puts "\tSubnet #{sd.body['subnet']['subnetId']} created for VPC #{vpcID}"
         end
-        compute.create_tags(sd.body['subnet']['subnetId'], {"Name" => "DMZ"})
-        compute.associate_route_table(route_table_id, sd.body['subnet']['subnetId'])
-        puts "\tSubnets created for VPC " << vpcID
-    else
-        puts "\tSubnets created for VPC " << vpcID
     end
 
     #return hash of subnets Name and Id
@@ -203,24 +227,19 @@ def make_or_get_nat_node(compute, vpcID, opts)
     # 
     # Is the Amazon nat instance running?
     #
-    instances = compute.describe_instances
+    servers=compute.servers
     puts "\n###################################################################################"
-    puts "\nVpcID\t\tTagName\n"
+    puts "\nVpcName\t\tTagName\n"
     #  List image ID, architecture and location
-    have_a_nat_box=0
-    instances.body['reservationSet'].each do |instance|
-        if instance['instancesSet'].first['instanceState']['name'] == 'running'
-            if instance['instancesSet'].first['tagSet']['Name'] =~ /NAT::#{opts[:name]}/
-                have_a_nat_box=1
-                puts  instance['instancesSet'].first['vpcId'] + "\t" + instance['instancesSet'].first['tagSet']['Name'] 
-            end
+    servers.each do |server|
+        if server.tags['Name'] == "NAT::#{opts[:name]}"
+            puts  "#{opts[:name]}\t\t#{server.tags['Name']}"
+            puts "\n###################################################################################"
+            return server
         end
     end
     puts "\n###################################################################################"
-    if have_a_nat_box == 1
-        puts "We have a nat box... returning"
-        return 1
-    end
+    puts "Making NAT BOX.."
     # 
     # get security groups and set to public id for nat box
     security_groups=make_or_get_security_grps(compute, vpcID, 1, opts)
@@ -235,9 +254,9 @@ def make_or_get_nat_node(compute, vpcID, opts)
     puts "Public Security Group: " << public_groupID
     # get subnets and set to DMZ id
     subnetID=nil
-    subnets=make_or_get_subnets(compute, vpcID, nil, 1, opts)
+    subnets=make_or_get_subnets(compute, vpcID, nil, nil, 1, opts)
     subnets.body['subnetSet'].each do |subnet|
-        if subnet['tagSet']['Name'] == 'DMZ'
+        if subnet['tagSet']['Name'] == "DMZ_Subnet::#{opts[:name]}"
             subnetID=subnet['subnetId']
         end
     end
@@ -248,9 +267,10 @@ def make_or_get_nat_node(compute, vpcID, opts)
     offerings.body['imagesSet'].each do |offering|
         image_id=offering['imageId']
     end
-    p image_id
     if image_id.nil?
         abort("Didn't find a amzn-ami-vpc-nat-pv-2013.03.1.x86_64-ebs image")
+    else
+        puts "Found a nat image #{image_id}"
     end
     # set server attr
     server_attributes = {
@@ -260,7 +280,7 @@ def make_or_get_nat_node(compute, vpcID, opts)
         :private_key_path => opts[:key_file_private],
         :public_key_path => opts[:key_file_pub],
         :image_id => image_id,
-        :tags => {'Name' => 'NAT::'+vpcID+'::'+subnetID},
+        :tags => {'Name' => "NAT::#{opts[:name]}"},
         :network_interfaces   => [{
             'DeviceIndex'               => '0',
             'SubnetId'                  => subnetID, 
@@ -274,6 +294,43 @@ def make_or_get_nat_node(compute, vpcID, opts)
     puts "Waiting for server sshable..."
     server.wait_for { sshable? }
     server.ssh(['pwd'])
+    compute.modify_instance_attribute(server.id, {'SourceDestCheck.Value' => 'false'})
     puts "Public IP Address: #{server.public_ip_address}"
     puts "Private IP Address: #{server.private_ip_address}"
+    return server
+end
+#
+# DNS
+#
+def get_zones(dns)
+    return dns.zones
+end
+def get_records_for_zone(dns, zone)
+    return dns.records('zone' => zone)
+end
+def get_zone_record_for_name(dns, zoneID, name)
+    return dns.list_resource_record_sets(zoneID, {:name => name, :type => 'A'})
+end
+def create_dns_record(dns, ip, name, ttl)
+    split_name=name.split(".")
+    short_name=split_name[0]
+    domain=split_name[1,3].join '.'
+    zones=get_zones(dns)
+    found=0
+    zoneID=nil
+    zones.each do |zone|
+        if zone.domain == domain + "."
+            zoneID=zone
+            r=get_records_for_zone(dns, zone)
+            r.each do |record|
+                if record.type == 'A' and record.name == name + "."
+                    found=1
+                end
+            end
+        end
+    end
+    if found == 0
+        zoneID.records.create(:value => ip, :name => name, :type => 'A', :ttl => ttl)
+    end
+    #zoneID.records.create(:value => ip, :name => name, :type => 'PTR', :ttl => ttl)
 end
