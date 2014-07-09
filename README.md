@@ -1,7 +1,8 @@
 labrador
 ========
 
-1) gem install fog; gem install trollop
+    gem install fog; 
+    gem install trollop
 
 2) Configure a fog_rc file
 ```
