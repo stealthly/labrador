@@ -2,8 +2,15 @@
 require 'rubygems'
 require 'fog'
 require 'trollop'
-require './foglibs'
-#
+require './libs/foglibs'
+require './libs/servers'
+require './libs/security'
+require './libs/subnets'
+require './libs/ssh_cmd'
+require './libs/dhcp'
+require 'net/ssh'
+require 'colored'
+
 # REGIONS
 # 
 #ap-northeast-1 Asia Pacific (Tokyo) Region
@@ -14,149 +21,138 @@ require './foglibs'
 ##us-east-1 US East (Northern Virginia) Region
 ##us-west-1 US West (Northern California) Region
 ##us-west-2 US West (Oregon) Region
-
 #
 # Options
 #
-opts = Trollop::options do
+$opts = Trollop::options do
     opt :fogrc, "file of fogrc settings http://fog.io/about/getting_started.html", :type => :string, :required => true
     opt :fog_credential, "which credentials to use from fogrc file", :type => :string, :required  => true
     opt :name, "VPC Name", :type => :string, :required  => true
+    opt :domain, "Subdomain to add dns to in Route53", :type => :string, :require => true
     opt :node_name, "Node Name", :type => :string, :required  => true
+    opt :nat_node_name, "Nat Node Name", :type => :string, :required  => true
     opt :region, "Region", :type => :string, :default => 'us-east-1', :required  => true
     opt :key_name, "The ssh keypair name in AWS to use", :type => :string , :required  => true
     opt :key_file_pub, "The ssh public key file to use", :type => :string, :required  => true
     opt :key_file_private, "The ssh private keyfile to use", :type => :string, :required  => true
-    opt :d_subnet, "dmz subnet 10.200.1.0/24 for example", :type => :bool, :default => false
-    opt :i_subnet, "intranet subnet 10.200.200.0/24 for example", :type => :bool, :default => false
-    opt :centos5, "centos 5.8", :type => :bool, :default => false
-    opt :centos6, "centos 6.5", :type => :bool, :default => false
-    opt :volume, "ebs volume type standard or io1", :type => :string
+    opt :subnet, "DMZ or INTRANET", :type => :string, :default => 'intranet', :required => true
+    opt :security_group, "public or private", :type => :string, :default => 'intranet', :required => true
+    opt :centos, "5,6,6hvm,6haproxy", :type => :string, :default => '6', :required => true
+    opt :flavor, "m1-medium r2-whatever", :type => :string , :required => true
+    opt :chef_env, "chef environement", :type => :string, :required => true
+    opt :knife_file, "knife config file", :type => :string, :required => true
+    opt :dns_server, "dns server to register with", :type => :string, :required => true
+    opt :run_list, "chef run list", :type => :string, :required => false
+    opt :volume, "ebs volume type standard, io1 or gp2", :type => :string
     opt :volume_size, "volume size in GB", :type => :int 
     opt :volume_iops, "volume iops 1 to 4000", :type => :int
-    opt :zone, "Avail zone", :type => :string, :required => true
+    opt :private_ip, "Ip Address to assign", :type => :string
 end
-#pp opts
-
 #
 # ENVIRONMENT Settings
 #
-ENV['FOG_RC'] =  opts[:fogrc]
-ENV['FOG_CREDENTIAL']= opts[:fog_credential]
-compute=Fog::Compute.new(:provider => 'AWS', :region => opts[:region])
+ENV['FOG_RC'] =  $opts[:fogrc]
+ENV['FOG_CREDENTIAL']= $opts[:fog_credential]
+
+def make_a_server(compute, subnet_name, vpcID, security_group, node_name, ip)
+    imageID=get_image(compute)
+    unless ! imageID.nil?
+        abort("Did not find image!")
+    end
+    subnet=get_subnet(compute, subnet_name)
+    unless ! subnet.nil?
+        abort("Did not find subnet!")
+    end
+    subnetID=subnet['subnetId']
+    zone=subnet['availabilityZone']
+    #https://github.com/fog/fog/blob/master/lib/fog/aws/requests/compute/run_instances.rb
+    security_groupID=get_security_group(compute, vpcID, security_group)
+    unless ! security_groupID.nil?
+        abort("Did not get security group")
+    end
+    server_attributes=get_server_attr(vpcID, imageID, node_name, subnetID, security_groupID, security_group, ip, zone)
+    puts server_attributes.to_yaml
+    server = compute.servers.create(server_attributes)
+    puts "Waiting for server ready..."
+    server.wait_for { ready? }
+    return server
+end
+#
+# Setup some stuff first
+#
+# Assign a private static ip in VPC
+private_ip_address=$opts[:private_ip] || nil
+# Figure out the username for the endpoint
+case $opts[:centos]
+when '6haproxy'
+        target_username='ec2-user'
+when '6hvm'
+    if $opts[:node_name] =~ /cass/ or $opts[:node_name] =~ /db/
+        target_username='root'
+    else
+        #basho boxes use ec2-user and don't work on i2.xlarge instances
+        target_username='ec2-user'
+    end
+else
+    target_username='root'
+end
+#Use a gateway or not? ( we need the nat_node_name to set the dns name 
+if $opts[:security_group] == 'private'
+    gw=$opts[:nat_node_name] 
+else
+    gw=nil
+end
+#Add to default run_list?
+if $opts[:run_list].nil?
+    run_list='cb-base'
+else
+    run_list=['cb-base', $opts[:run_list]].join(',')
+end
+full_name=$opts[:node_name].split(".")
+short_name=full_name.shift
+
 ########################################################################################
 # MAIN
-#
-#
+#####################################
+compute=Fog::Compute.new(:provider => 'AWS', :region => $opts[:region])
+dns=Fog::DNS.new(:provider => 'AWS')
 # get vpcid
-vpcID=get_vpc(compute, opts[:name], opts)
+puts "Checking VPC...#{$opts[:name]}"
+vpcID=get_vpc(compute, $opts[:name])
+puts "\tfound #{vpcID}".bold.blue
 if vpcID == nil
-    abort("I can't find #{opts[:name]}")
-end
-# find an image
-offerings=nil
-if opts[:centos5] == true
-    offerings=compute.describe_images({ :'name' => 'RightImage_CentOS_5.8_x64_v5.8.8.3_EBS',  :'architecture' => 'x86_64'})
-elsif opts[:centos6] == true
-    offerings=compute.describe_images({ :'name' => 'CentOS-6.5-GA-03.3*',   :'owner-id' => '679593333241', :'architecture' => 'x86_64'})
-else
-    abort("Need to say centos5 or centos6")
-end
-imageID=offerings.body['imagesSet'].first['imageId']
-if imageID !~ /ami/
-    abort("Did not find an ami image")
-end
-# get subnet
-subnets=compute.describe_subnets()
-our_subnets={}
-subnets.body['subnetSet'].each  do |subnet|
-    name=subnet['tagSet']['Name']
-    id=subnet['subnetId']
-    our_subnets.merge!({name => id}) 
-end
-#get security group
-sgroups=compute.describe_security_groups({:'vpc-id' => vpcID})
-our_sgroups={}
-pp sgroups
-sgroups.body['securityGroupInfo'].each do |sg|
-    name=sg['groupName']
-    id=sg['groupId']
-    our_sgroups.merge!({name => id}) 
-end
-# Setup requirements for server
-groupID=nil
-subnetID=nil
-true_or_false=nil
-if opts[:i_subnet] == true
-    subnetID=our_subnets['INTRANET']  
-    groupID=our_sgroups['private']
-    true_or_false=false
-elsif opts[:d_subnet] == true
-    subnetID=our_subnets['DMZ']  
-    groupID=our_sgroups['public']
-    true_or_false=true
-else
-    abort("What subnet does this box goes in? ")
-end
-server_attributes = {
-    :vpc_id => vpcID,
-    :flavor_id => 'm1.medium',
-    :key_name => opts[:key_name],
-    :private_key_path => opts[:key_file_private],
-    :public_key_path => opts[:key_file_pub],
-    :image_id => imageID,
-    :tags => {'Name' => "#{opts[:node_name]}::#{vpcID}::#{subnetID}"},
-    :network_interfaces   => [{
-        'DeviceIndex'               => '0',
-        'SubnetId'                  => subnetID,
-        'AssociatePublicIpAddress'  => true_or_false,
-        'SecurityGroupId'           => [groupID]
-                           }]
-}
-server = compute.servers.create(server_attributes)
-puts "Waiting for server ready..."
-server.wait_for { ready? }
-puts "Private IP Address: #{server.private_ip_address}"
-#
-# Create a volume and attach it
-#
-if ! opts[:volume].to_s.empty? # false, it's not empty
-    puts "Creating Volume..."
-    if ! opts[:volume_size].to_s.empty? # false, it's not empty
-        if opts[:volume] == 'io1'
-            if opts[:volume_iops].to_s.empty? # true, it is empty
-                abort("You need to define iops value --volume-iops")
-            else 
-                options={'VolumeType' => opts[:volume], 'Iops' => opts[:volume_iops]} 
-                volume=compute.create_volume(opts[:zone], opts[:volume_size], options)
-            end
-        else
-                volume=compute.create_volume(opts[:zone], opts[:volume_size])
-        end
-    else
-        abort("You need to define a size --volume-size")
-    end
-    if ! volume.to_s.empty?
-       loop do
-            v=compute.describe_volumes(:'attachment.status' => 'detached')
-            if volume.body.select {|id| id['volumeId']  == volume.body['volumeId'] }
-                tag=compute.create_tags(volume.body['volumeId'], {"Name" => "#{opts[:node_name]}::#{opts[:name]}"})
-                volume.attach(server.id,"vdc")
-                break
-            else
-                volume.body.each do |volume|
-                    p volume['volumeId']
-                end
-            end
-            sleep 5 
-        end
-    else
-        abort("Volume creation failed")
-    end
+    abort("I can't find #{$opts[:name]}")
 end
 
-#
-# setup DNS
-#
-create_dns_record(dns, public_ip, opts[:node_name], 1800)
+server=get_server(compute, vpcID, "#{$opts[:node_name]}::#{$opts[:name]}")
+if server.nil?
+    puts "\t...making server..."
+    server=make_a_server(compute, "#{$opts[:subnet]}_Subnet", vpcID, $opts[:security_group], $opts[:node_name], private_ip_address)
+end
 
+if $opts[:security_group] == 'private'
+    puts "\t...ssh to server..."
+    loop do
+        puts "\t\ttrying telnet to port 22.."
+        command_output=ssh_command($opts[:nat_node_name], 'ec2-user', "nc -zw3 #{server.private_ip_address} 22 && echo 'open' || echo 'closed'")
+        puts "\tPort 22 on #{server.private_ip_address} is #{command_output}"
+        if command_output[0] =~ /open/
+            puts "Breaking..."
+            break
+        end
+        puts "\t\tsleeping..."
+        sleep 5
+    end
+    jumpbox(target_username, 'hostname', server.private_ip_address)
+    puts "\t...bootstrap server..."
+    puts "\t...adding to dns..."
+    jumpbox('ec2-user', "sudo /etc/pdns/makeRecord.rb --name #{$opts[:node_name]} --ip #{server.private_ip_address}", $opts[:dns_server])
+    bootstrap(server, target_username, $opts[:node_name], run_list, gw)
+else
+    puts "\t\t...ssh to #{server.public_ip_address}..."
+    server.username=target_username
+    server.wait_for { sshable? }
+    jumpbox('ec2-user', "sudo /etc/pdns/makeRecord.rb --name #{$opts[:node_name]} --ip #{server.private_ip_address}", $opts[:dns_server])
+    create_internet_dns_record(dns, server.public_ip_address, "#{short_name}.#{$opts[:domain]}" , $opts[:domain], '300')
+    bootstrap(server, target_username, $opts[:node_name], run_list, gw)
+end
